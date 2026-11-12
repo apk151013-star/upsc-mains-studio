@@ -12,6 +12,121 @@ import "./styles.css";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
+/* ---------- Text extraction + handwriting OCR ---------- */
+const TEXT_LIMIT = 45000;       // max characters sent to the AI per file
+const OCR_MAX_PAGES = 20;       // max handwritten pages per file (controls cost + time)
+const OCR_CONCURRENCY = 2;      // pages transcribed in parallel
+const MAX_SIDE = 1800;          // longest page edge (px) sent for OCR
+const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp"];
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function bitmapToJpeg(bitmap) {
+  const scale = Math.min(1, MAX_SIDE / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.82);
+}
+
+async function pdfPageToJpeg(page) {
+  const base = page.getViewport({ scale: 1 });
+  const viewport = page.getViewport({ scale: MAX_SIDE / Math.max(base.width, base.height) });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.floor(viewport.width); canvas.height = Math.floor(viewport.height);
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+  return canvas.toDataURL("image/jpeg", 0.82);
+}
+
+async function ocrOnePage(image, pageNo, attempt = 0) {
+  let res, data = {};
+  try {
+    res = await fetch("/api/ocr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image, page: pageNo }) });
+    try { data = await res.json(); } catch { /* non-JSON (e.g. gateway timeout page) */ }
+  } catch { throw new Error("Network problem while reading handwriting. Please check your connection and try again."); }
+  if (!res.ok) {
+    if (attempt < 1 && (res.status >= 500 || res.status === 429)) { await sleep(1500); return ocrOnePage(image, pageNo, attempt + 1); }
+    if (res.status === 502 || res.status === 504) throw new Error(`Reading page ${pageNo} timed out. Try again, or set a faster OPENAI_OCR_MODEL in Netlify.`);
+    throw new Error(data.error || `Handwriting OCR failed on page ${pageNo} (HTTP ${res.status}).`);
+  }
+  return data.text || "";
+}
+
+// items: [{ pageNo, getImage: async () => dataUrl }] -> array of transcribed strings (same order)
+async function ocrPages(items, onProgress) {
+  const out = new Array(items.length);
+  let next = 0, done = 0, failed = false;
+  onProgress(0, items.length);
+  async function worker() {
+    while (!failed && next < items.length) {
+      const i = next++;
+      try {
+        out[i] = await ocrOnePage(await items[i].getImage(), items[i].pageNo);
+        onProgress(++done, items.length);
+      } catch (e) { failed = true; throw e; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(OCR_CONCURRENCY, items.length) }, worker));
+  return out;
+}
+
+async function extractFromPdf(file, onProgress) {
+  const data = new Uint8Array(await file.arrayBuffer());
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
+  const pageTexts = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    pageTexts.push(content.items.map(x => x.str).join(" ").trim());
+  }
+  // Pages with (almost) no selectable text are scanned/handwritten -> OCR only those pages.
+  const needOcr = pageTexts.map((t, i) => (t.length < 40 ? i : -1)).filter(i => i >= 0);
+  if (!needOcr.length) {
+    return { name: file.name, type: "PDF", pages: pdf.numPages, source: "text", text: pageTexts.join("\n").slice(0, TEXT_LIMIT) };
+  }
+  if (needOcr.length > OCR_MAX_PAGES) throw new Error(`This PDF has ${needOcr.length} handwritten/scanned pages. The limit is ${OCR_MAX_PAGES} pages per file; please split the PDF into smaller parts.`);
+  const items = needOcr.map(i => ({ pageNo: i + 1, getImage: async () => pdfPageToJpeg(await pdf.getPage(i + 1)) }));
+  const ocrTexts = await ocrPages(items, onProgress);
+  const merged = pageTexts.map((t, i) => {
+    const k = needOcr.indexOf(i);
+    return `[Page ${i + 1}]\n${k >= 0 ? ocrTexts[k] : t}`;
+  }).join("\n\n");
+  if (merged.replace(/\[Page \d+\]|\[blank page\]/g, "").trim().length < 30) throw new Error("No readable writing was found in this file. Try a clearer, well-lit scan.");
+  return { name: file.name, type: "PDF", pages: pdf.numPages, source: "ocr", text: merged.slice(0, TEXT_LIMIT) };
+}
+
+async function extractFromImages(files, onProgress) {
+  if (files.length > OCR_MAX_PAGES) throw new Error(`Please upload at most ${OCR_MAX_PAGES} page images at a time.`);
+  const sorted = [...files].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const items = sorted.map((f, i) => ({ pageNo: i + 1, getImage: async () => { const bmp = await createImageBitmap(f); try { return bitmapToJpeg(bmp); } finally { bmp.close?.(); } } }));
+  const texts = await ocrPages(items, onProgress);
+  const merged = texts.map((t, i) => `[Page ${i + 1}]\n${t}`).join("\n\n");
+  if (merged.replace(/\[Page \d+\]|\[blank page\]/g, "").trim().length < 30) throw new Error("No readable writing was found in these images. Try clearer, well-lit photos.");
+  return { name: sorted.length === 1 ? sorted[0].name : `${sorted.length} page photos`, type: "IMAGE", pages: sorted.length, source: "ocr", text: merged.slice(0, TEXT_LIMIT) };
+}
+
+async function extractText(fileList, onProgress) {
+  const files = Array.from(fileList || []).filter(Boolean);
+  if (!files.length) return null;
+  const exts = files.map(f => f.name.split(".").pop().toLowerCase());
+  if (files.length > 1) {
+    if (!exts.every(e => IMAGE_EXTS.includes(e))) throw new Error("To upload several files at once, choose only page photos (JPG, PNG, WEBP). PDFs, DOCX and TXT must be uploaded one at a time.");
+    return extractFromImages(files, onProgress);
+  }
+  const file = files[0], ext = exts[0];
+  if (ext === "pdf") return extractFromPdf(file, onProgress);
+  if (IMAGE_EXTS.includes(ext)) return extractFromImages(files, onProgress);
+  if (ext === "txt" || ext === "md") return { name: file.name, type: ext.toUpperCase(), pages: 1, source: "text", text: (await file.text()).slice(0, TEXT_LIMIT) };
+  if (ext === "docx") {
+    const mammoth = await import("https://cdn.jsdelivr.net/npm/mammoth@1.8.0/+esm");
+    const parsed = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+    return { name: file.name, type: "DOCX", pages: 1, source: "text", text: parsed.value.slice(0, TEXT_LIMIT) };
+  }
+  throw new Error("Please upload a PDF, page photos (JPG/PNG/WEBP), DOCX, TXT or MD file.");
+}
+
 const navItems = [
   { id: "evaluate", label: "Answer evaluator", icon: FileCheck2 },
   { id: "compare", label: "Copy comparison", icon: Layers3 },
@@ -25,6 +140,7 @@ function App() {
   const [topper, setTopper] = useState(null);
   const [myCopy, setMyCopy] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [reading, setReading] = useState(null); // { done, total } while OCR / parsing runs
   const [result, setResult] = useState(null);
   const [compareResult, setCompareResult] = useState(null);
   const [error, setError] = useState("");
@@ -36,38 +152,17 @@ function App() {
 
   const dateLabel = new Intl.DateTimeFormat("en-IN", { weekday: "long", day: "numeric", month: "long" }).format(new Date());
 
-  async function extractText(file) {
-    if (!file) return null;
-    const ext = file.name.split(".").pop().toLowerCase();
-    if (ext === "pdf") {
-      const data = new Uint8Array(await file.arrayBuffer());
-      const pdf = await pdfjsLib.getDocument({ data }).promise;
-      let text = "";
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const content = await page.getTextContent();
-        text += content.items.map(x => x.str).join(" ") + "\n";
-      }
-      if (text.trim().length < 60) throw new Error("This PDF appears to be scanned or image-only. Please upload a text-based PDF or DOCX/TXT for now.");
-      return { name: file.name, type: "PDF", pages: pdf.numPages, text: text.slice(0, 45000) };
-    }
-    if (ext === "txt" || ext === "md") return { name: file.name, type: ext.toUpperCase(), pages: 1, text: (await file.text()).slice(0, 45000) };
-    if (ext === "docx") {
-      const mammoth = await import("https://cdn.jsdelivr.net/npm/mammoth@1.8.0/+esm");
-      const parsed = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
-      return { name: file.name, type: "DOCX", pages: 1, text: parsed.value.slice(0, 45000) };
-    }
-    throw new Error("Please upload a PDF, DOCX, TXT or MD file.");
-  }
-
-  async function onFile(file, setter) {
+  async function onFile(fileList, setter) {
     setError("");
-    if (!file) return;
+    const files = Array.from(fileList || []);
+    if (!files.length || reading) return;
     try {
-      if (file.size > 20 * 1024 * 1024) throw new Error("File is larger than 20 MB. Please upload a smaller file.");
-      const parsed = await extractText(file);
+      if (files.some(f => f.size > 20 * 1024 * 1024)) throw new Error("A file is larger than 20 MB. Please upload a smaller file.");
+      setReading({ done: 0, total: 0 });
+      const parsed = await extractText(files, (done, total) => setReading({ done, total }));
       setter(parsed);
     } catch (e) { setError(e.message || "Could not read that file."); }
+    finally { setReading(null); }
   }
 
   async function callAI(action, payload) {
@@ -144,42 +239,46 @@ function App() {
 
       <div className="content">
         {error && <div className="error-banner"><CircleHelp size={17}/><span>{error}</span><button onClick={() => setError("")}><X size={15}/></button></div>}
+        {reading && <div className="ocr-banner"><span className="spinner"/><div><b>{reading.total ? "Reading handwriting…" : "Preparing your file…"}</b>{reading.total > 0 && <small>{reading.done} of {reading.total} {reading.total === 1 ? "page" : "pages"} transcribed. Handwritten pages can take a few seconds each.</small>}{reading.total > 0 && <div className="ocr-bar"><i style={{ width: `${(reading.done / reading.total) * 100}%` }}/></div>}</div></div>}
         {page === "evaluate" && <section className="page-enter">
           <div className="hero-row">
             <div><div className="eyebrow"><span className="eyebrow-line"/> YOUR PERSONAL MAINS MENTOR</div><h1>Turn every answer<br/>into <em>an advantage.</em></h1><p className="hero-copy">Upload your answer. Get examiner-style feedback, actionable improvements and the next questions you should practise.</p></div>
             <div className="hero-visual"><div className="visual-grid"/><div className="glass-disc disc-back"/><div className="glass-disc disc-front"><div className="disc-inner"><BrainCircuit size={39}/><span>AI</span></div></div><div className="float-tag tag-top"><Sparkles size={13}/> DEEP ANALYSIS</div><div className="float-tag tag-bottom"><span className="tiny-bars"><i/><i/><i/><i/></span> ANSWER INTELLIGENCE</div><div className="visual-cross">✳</div></div>
           </div>
-          <div className="section-heading"><div><span className="section-index">01 / SUBMIT</span><h2>Evaluate an answer</h2><p>One upload. A complete improvement roadmap.</p></div><div className="supported"><ShieldCheck size={15}/> YOUR FILE STAYS IN THIS SESSION</div></div>
+          <div className="section-heading"><div><span className="section-index">01 / SUBMIT</span><h2>Evaluate an answer</h2><p>One upload. A complete improvement roadmap.</p></div><div className="supported"><ShieldCheck size={15}/> FILES ARE NOT STORED</div></div>
           <div className="upload-panel">
             <div className="upload-main">
               <FileDrop file={answer} onFile={f => onFile(f, setAnswer)} title="Drop your answer copy here" subtitle="or browse files from your device" />
-              <div className="upload-foot"><span><FileText size={14}/> PDF, DOCX, TXT, MD</span><span>MAX 20 MB</span></div>
+              <div className="upload-foot"><span><FileText size={14}/> PDF (typed or handwritten), PHOTOS, DOCX, TXT</span><span>MAX 20 MB</span></div>
             </div>
             <div className="upload-side">
               <div className="side-kicker">WHAT YOU'LL GET</div>
               <div className="benefit"><div className="benefit-icon"><Gauge size={17}/></div><div><b>Examiner-style evaluation</b><small>Structure, relevance, depth & presentation</small></div></div>
               <div className="benefit"><div className="benefit-icon"><ScanSearch size={17}/></div><div><b>Line-by-line diagnosis</b><small>What works, what is missing, what to fix</small></div></div>
               <div className="benefit"><div className="benefit-icon"><Target size={17}/></div><div><b>Targeted practice</b><small>Follow-up Mains questions on weak areas</small></div></div>
-              <button className="primary-btn full-btn" disabled={!answer || busy} onClick={evaluate}>{busy ? <><span className="spinner"/> Analysing your answer</> : <>Evaluate my answer <ArrowRight size={17}/></>}</button>
+              <button className="primary-btn full-btn" disabled={!answer || busy || !!reading} onClick={evaluate}>{busy ? <><span className="spinner"/> Analysing your answer</> : <>Evaluate my answer <ArrowRight size={17}/></>}</button>
             </div>
           </div>
-          {answer && <div className="file-chip"><FileCheck2 size={16}/><div><b>{answer.name}</b><small>{answer.type} · {answer.pages} {answer.pages === 1 ? "page" : "pages"} · text extracted</small></div><button onClick={() => setAnswer(null)}><X size={15}/></button></div>}
+          {answer && <div className="file-chip"><FileCheck2 size={16}/><div><b>{answer.name}</b><small>{answer.type} · {answer.pages} {answer.pages === 1 ? "page" : "pages"} · {answer.source === "ocr" ? "handwriting transcribed" : "text extracted"}</small></div><button onClick={() => setAnswer(null)}><X size={15}/></button></div>}
+          {answer?.source === "ocr" && <TranscriptReview file={answer} setFile={setAnswer} />}
           {result && <ResultPanel data={result} title="Your answer evaluation" />}
-          <div className="bottom-tip"><Zap size={15}/><span><b>Pro tip:</b> Upload a complete answer with the question statement for the most accurate evaluation.</span></div>
+          <div className="bottom-tip"><Zap size={15}/><span><b>Pro tip:</b> Upload a complete answer with the question statement for the most accurate evaluation. Handwritten? Scan in good light and check the transcription below before evaluating.</span></div>
         </section>}
 
         {page === "compare" && <section className="page-enter">
           <div className="eyebrow"><span className="eyebrow-line"/> LEARN FROM THE BEST</div><h1>Study the gap.<br/><em>Close the distance.</em></h1><p className="hero-copy narrow">Compare a topper's answer with your own handwritten copy. Discover the differences in approach, structure, content and presentation.</p>
-          <div className="section-heading compare-heading"><div><span className="section-index">02 / COMPARE</span><h2>Two copies. One clear direction.</h2><p>Upload both PDFs to get a side-by-side learning analysis.</p></div><div className="compare-badge"><Layers3 size={15}/> COMPARATIVE MODE</div></div>
+          <div className="section-heading compare-heading"><div><span className="section-index">02 / COMPARE</span><h2>Two copies. One clear direction.</h2><p>Upload both copies (typed or handwritten PDFs, or page photos) to get a side-by-side learning analysis.</p></div><div className="compare-badge"><Layers3 size={15}/> COMPARATIVE MODE</div></div>
           <div className="compare-grid">
             <div className="compare-upload"><div className="compare-number">A</div><div className="compare-title"><span>REFERENCE COPY</span><h3>Topper's answer</h3><p>The benchmark you want to learn from.</p></div><FileDrop compact file={topper} onFile={f => onFile(f, setTopper)} title="Drop topper PDF" subtitle="or browse your device" /></div>
             <div className="compare-middle"><div className="versus">VS</div><div className="versus-line"/></div>
             <div className="compare-upload"><div className="compare-number number-purple">B</div><div className="compare-title"><span>YOUR SUBMISSION</span><h3>My handwritten copy</h3><p>Your answer, ready for honest feedback.</p></div><FileDrop compact file={myCopy} onFile={f => onFile(f, setMyCopy)} title="Drop your answer PDF" subtitle="or browse your device" /></div>
           </div>
-          <div className="compare-action"><div><b>Ready for your comparison?</b><small>AI will identify the gap and turn it into a practical improvement plan.</small></div><button className="primary-btn" disabled={!topper || !myCopy || busy} onClick={compare}>{busy ? <><span className="spinner"/> Comparing copies</> : <>Compare both copies <ArrowRight size={17}/></>}</button></div>
+          <div className="compare-action"><div><b>Ready for your comparison?</b><small>AI will identify the gap and turn it into a practical improvement plan.</small></div><button className="primary-btn" disabled={!topper || !myCopy || busy || !!reading} onClick={compare}>{busy ? <><span className="spinner"/> Comparing copies</> : <>Compare both copies <ArrowRight size={17}/></>}</button></div>
           {(topper || myCopy) && <div className="selected-files">{topper && <span><Check size={13}/> Topper: {topper.name}</span>}{myCopy && <span><Check size={13}/> Your copy: {myCopy.name}</span>}</div>}
+          {topper?.source === "ocr" && <TranscriptReview file={topper} setFile={setTopper} label="topper's copy" />}
+          {myCopy?.source === "ocr" && <TranscriptReview file={myCopy} setFile={setMyCopy} label="your copy" />}
           {compareResult && <ResultPanel data={compareResult} title="Comparative analysis" />}
-          <div className="comparison-note"><ShieldCheck size={16}/><span>For best results, upload text-based PDFs. Scanned handwritten pages require OCR; image-only PDFs are not yet supported in this version.</span></div>
+          <div className="comparison-note"><ShieldCheck size={16}/><span>Handwritten and scanned PDFs are read with AI handwriting recognition. Use clear, well-lit scans (dark ink, flat pages) and review the transcription before comparing.</span></div>
         </section>}
 
         {page === "daily" && <section className="page-enter">
@@ -209,12 +308,20 @@ function FileDrop({ file, onFile, title, subtitle, compact = false }) {
   const [drag, setDrag] = useState(false);
   return <label className={`drop-zone ${compact ? "compact-drop" : ""} ${drag ? "dragging" : ""} ${file ? "has-file" : ""}`}
     onDragOver={e => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
-    onDrop={e => { e.preventDefault(); setDrag(false); onFile(e.dataTransfer.files?.[0]); }}>
-    <input type="file" accept=".pdf,.docx,.txt,.md,application/pdf" onChange={e => onFile(e.target.files?.[0])}/>
+    onDrop={e => { e.preventDefault(); setDrag(false); onFile(e.dataTransfer.files); }}>
+    <input type="file" multiple accept=".pdf,.docx,.txt,.md,.jpg,.jpeg,.png,.webp,application/pdf,image/*" onChange={e => { onFile(e.target.files); e.target.value = ""; }}/>
     <div className="drop-icon"><UploadCloud size={compact ? 21 : 25}/></div>
     <b>{file ? "File ready to analyse" : title}</b><span>{file ? file.name : subtitle}</span>
     {!file && <small>BROWSE FILES <ArrowDown size={11}/></small>}
   </label>;
+}
+
+function TranscriptReview({ file, setFile, label = "answer" }) {
+  return <details className="ocr-review">
+    <summary><ScanSearch size={15}/> Review &amp; correct the handwriting transcription ({label})</summary>
+    <p>AI handwriting reading can misread words. Fix anything important before evaluating; <code>[illegible]</code> and <code>[?]</code> mark uncertain words.</p>
+    <textarea value={file.text} onChange={e => setFile({ ...file, text: e.target.value })} spellCheck="false" />
+  </details>;
 }
 
 function ResultPanel({ data, title }) {
